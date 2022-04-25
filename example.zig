@@ -1,6 +1,9 @@
 const std = @import("std");
 const ap = @import("src/argparse.zig");
 
+// my user-defined constructor for my parser
+const myParser = @import("example-completion.zig").myParser;
+
 pub fn main() !void {
     // setup allocator
     // var allocator = std.testing.allocator;
@@ -9,16 +12,8 @@ pub fn main() !void {
     defer arena.deinit();
 
     // create parser
-    // var parser = ap.Parser.init(allocator, opt);
-    var parser = ap.Parser{
-        .options = .{},
-        .allocator = allocator,
-        .arguments = std.ArrayList(ap.Argument).init(allocator),
-        .group = null,
-        .item = null,
-    };
+    var parser = try myParser(allocator);
     defer parser.deinit();
-    try @import("example-completion.zig").myArguments(&parser);
 
     // parse arguments
     try parser.parseArgs();

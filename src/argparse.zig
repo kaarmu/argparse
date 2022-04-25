@@ -51,7 +51,6 @@ pub const Parser = struct {
     options: ParserOptions,
     allocator: Allocator,
     arguments: ArrayList(Argument),
-    group: ?Group,
     item: ?Str,
 
     pub const ParserOptions = struct {
@@ -65,7 +64,7 @@ pub const Parser = struct {
     /// You must supply the allocator, call `deinit` when memory should be released.
     ///
     ///     allocator - Use for instance ArenaAllocator with page allocator.
-    pub fn init(allocator: Allocator, options: ParserOptions) Parser {
+    pub fn init(allocator: Allocator, comptime options: ParserOptions) Parser {
         var parser = Parser{
             .options = options,
             .allocator = allocator,
@@ -174,7 +173,7 @@ pub const Parser = struct {
                     } else {
                         group.ready = false;
                         break ParserError.ItemNotRecognized;
-                    }
+                    };
                     try group.needle.found(item);
                 } else if (0 < group.needle.capacity()) {
                     if (group.needle.state == .unfound)
@@ -189,14 +188,14 @@ pub const Parser = struct {
         } else null;
 
         if (parsing_error) |err| {
-                if (self.options.fmtErrFn) |fmtErrFn|
-                    try fmtErrFn(
-                        self,
-                        @errSetCast((ParserError || ArgumentError), err),
-                        stderr_writer,
-                    )
-                else
-                    return err;
+            if (self.options.fmtErrFn) |fmtErrFn|
+                try fmtErrFn(
+                    self,
+                    @errSetCast((ParserError || ArgumentError), err),
+                    stderr_writer,
+                )
+            else
+                return err;
         }
 
         for (self.arguments.items) |*arg|
@@ -693,7 +692,7 @@ pub const Argument = struct {
 
 // TODO: See ~/playground/my-argparse-app
 pub fn bashCompletion(parser: Parser, _: struct {}) !void {
-    const writer = parser.options.stdout_writer;
+    const writer = std.io.getStdOut().writer();
 
     const comp_line = std.os.getenv("COMP_LINE") orelse return; // The current command line.
     _ = std.os.getenv("COMP_POINT") orelse return; // The index of the current cursor position relative to the beginning of the current command. If the current cursor position is at the end of the current command, the value of this variable is equal to ${#COMP_LINE}.
@@ -770,8 +769,7 @@ pub fn formatRepr(
 const FormatUsageFn = FnPtrType(fn (*Parser, FileWriter) FileWriter.Error!void);
 
 pub fn formatUsageX1(parser: *Parser, writer: FileWriter) FileWriter.Error!void {
-    parser.initGroup();
-    var group = &parser.group.?;
+    var group = Group.init(parser.arguments.items);
 
     try writer.writeAll("usage: ");
     while (group.ready) : (group.next()) {

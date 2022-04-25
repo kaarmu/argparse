@@ -13,9 +13,14 @@ const ap = @import("src/argparse.zig");
 // ^ ^ ^ ^ ^ ^ ^ ^ ^ ^
 // 0 2 4 6 8 10  12  14
 
-pub inline fn myArguments(parser: anytype) !void {
+pub inline fn myParser(allocator: std.mem.Allocator) !ap.Parser {
+    // don't forget to deinit on the parser
+    var parser = ap.Parser.init(allocator, .{});
+
     try parser.addArgument(.{ .short = "n", .long = "names", .nargs = '*' });
     try parser.addArgument(.{ .short = "c", .long = "count", .nargs = 1, .default = "1" });
+
+    return parser;
 }
 
 pub fn main() !void {
@@ -25,10 +30,8 @@ pub fn main() !void {
     defer arena.deinit();
 
     // create parser
-    var parser = ap.CompletionParser.init(allocator, .{});
+    var parser = try myParser(allocator);
     defer parser.deinit();
-
-    try myArguments(&parser);
 
     // completion program
     try ap.bashCompletion(parser, .{});
