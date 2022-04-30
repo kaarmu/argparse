@@ -14,6 +14,13 @@ const ArgIterator = std.process.ArgIterator;
 const File = std.fs.File;
 const FileWriter = std.fs.File.Writer;
 
+fn FnPtrType(comptime T: type) type {
+    return switch (@import("builtin").zig_backend) {
+        .stage1 => T,
+        else => *const T,
+    };
+}
+
 //--------//
 // Parser //
 //--------//
@@ -690,68 +697,103 @@ pub const Argument = struct {
 // Completion //
 //------------//
 
-// TODO: See ~/playground/my-argparse-app
-pub fn bashCompletion(parser: Parser, _: struct {}) !void {
-    const writer = std.io.getStdOut().writer();
+/// Completion algorithm for bash.
+///
+/// Environment variables:
+///     COMP_LINE   The current command line.
+///     COMP_TYPE   Set to an integer value corresponding to the type of completion attempted that caused a completion function to be called. See switch statement below.
+///     COMP_POINT  The index of the current cursor position relative to the beginning of the current command. If the current cursor position is at the end of the current command, the value of this variable is equal to ${#COMP_LINE}.
+///     COMP_KEY    The key (or final key of a key sequence) used to invoke the current completion function.
+pub const BashCompletion = struct {
+    const CompletionFn = FnPtrType(fn (*Parser, FileWriter, u8, Str) FileWriter.Error!void);
 
-    const comp_line = std.os.getenv("COMP_LINE") orelse return; // The current command line.
-    _ = std.os.getenv("COMP_POINT") orelse return; // The index of the current cursor position relative to the beginning of the current command. If the current cursor position is at the end of the current command, the value of this variable is equal to ${#COMP_LINE}.
-    const comp_type = std.os.getenv("COMP_TYPE") orelse return; // Set to an integer value corresponding to the type of completion attempted that caused a completion function to be called. See switch statement below.
-    _ = std.os.getenv("COMP_KEY") orelse return; // The key (or final key of a key sequence) used to invoke the current completion function.
+    normalFn: CompletionFn = Included.normalX1,
+    successiveFn: CompletionFn = Included.successiveX1,
+    alternativesFn: CompletionFn = Included.invalid,
+    unmodifiedFn: CompletionFn = Included.invalid,
+    menuFn: CompletionFn = Included.invalid,
+    invalidFn: CompletionFn = Included.invalid,
 
-    // var inner_parser = ArgumentParser.Inner(@Type(words)).init(parser, &words);
-    // std.log.info("\"{s}\"", .{comp_line});
+    pub fn complete(self: BashCompletion, parser: *Parser) !void {
+        const writer = std.io.getStdOut().writer();
 
-    var words = std.mem.tokenize(u8, comp_line, " ");
-    var last_word: []const u8 = undefined;
-    while (words.next()) |item|
-        last_word = item;
+        const env_comp_line: Str = std.os.getenv("COMP_LINE") orelse return;
+        const env_comp_type: Str = std.os.getenv("COMP_TYPE") orelse return;
+        // const env_comp_point: Str = std.os.getenv("COMP_POINT") orelse return;
+        // const env_comp_key: Str = std.os.getenv("COMP_KEY") orelse return;
 
-    _ = comp_line;
-    _ = comp_type;
-    _ = parser;
-    _ = writer;
+        const comp_type = try std.fmt.parseUnsigned(u8, env_comp_type, 10);
 
-    // TAB, for normal completion
-    // ‘?’, for listing completions after successive tabs
-    // ‘!’, for listing alternatives on partial word completion
-    // ‘@’, to list completions if the word is not unmodified
-    // ‘%’, for menu completion
-    switch (try std.fmt.parseUnsigned(u8, comp_type, 10)) {
-        '\t' => for (parser.arguments.items) |*arg| {
-            if (std.mem.eql(u8, "-", last_word)) {
-                if (arg.options.short) |name| try writer.print("-{s}\n", .{name});
-                if (arg.options.long) |name| try writer.print("--{s}\n", .{name});
-            } else if (arg.isPartialShort(last_word)) {
-                try writer.print("-{s}\n", .{arg.options.short.?});
-            } else if (arg.isPartialLong(last_word)) {
-                try writer.print("--{s}\n", .{arg.options.long.?});
-            }
-        },
-        '?' => for (parser.arguments.items) |*arg| {
-            if (arg.options.short != null and arg.options.long != null) {
-                try writer.print("-{s}/--{s}\n", .{ arg.options.short.?, arg.options.long.? });
-            } else if (arg.options.short) |name| {
-                try writer.print("-{s}\n", .{name});
-            } else if (arg.options.long) |name| {
-                try writer.print("-{s}\n", .{name});
-            }
-        },
-        '!', '@', '%' => |c| std.log.err("Not implemented yet - COMP_TYPE='{c}'", .{c}),
-        else => |c| std.log.err("Invalid COMP_TYPE='{c}'", .{c}),
+        // TAB, for normal completion
+        // ‘?’, for listing completions after successive tabs
+        // ‘!’, for listing alternatives on partial word completion
+        // ‘@’, to list completions if the word is not unmodified
+        // ‘%’, for menu completion
+        switch (comp_type) {
+            '\t' => try self.normalFn(parser, writer, comp_type, env_comp_line),
+            '?' => try self.successiveFn(parser, writer, comp_type, env_comp_line),
+            '!' => try self.alternativesFn(parser, writer, comp_type, env_comp_line),
+            '@' => try self.unmodifiedFn(parser, writer, comp_type, env_comp_line),
+            '%' => try self.menuFn(parser, writer, comp_type, env_comp_line),
+            else => try self.invalidFn(parser, writer, comp_type, env_comp_line),
+        }
     }
-}
+
+    const Included = struct {
+        pub fn invalid(
+            _: *Parser,
+            _: FileWriter,
+            comp_type: u8,
+            _: Str,
+        ) FileWriter.Error!void {
+            std.log.err("Invalid completion - COMP_TYPE='{c}'", .{comp_type});
+        }
+
+        pub fn normalX1(
+            parser: *Parser,
+            writer: FileWriter,
+            _: u8,
+            comp_line: Str,
+        ) FileWriter.Error!void {
+            var word_iter = std.mem.tokenize(u8, comp_line, " ");
+            var last_word: Str = undefined;
+            while (word_iter.next()) |word|
+                last_word = word;
+
+            for (parser.arguments.items) |*arg|
+                if (arg.isMatch(last_word)) {
+                    continue; // do not list if exactly equal
+                } else if (std.mem.eql(u8, "-", last_word)) {
+                    if (arg.options.short) |name| try writer.print("-{s}\n", .{name});
+                    if (arg.options.long) |name| try writer.print("--{s}\n", .{name});
+                } else if (arg.isPartialShort(last_word)) {
+                    try writer.print("-{s}\n", .{arg.options.short.?});
+                } else if (arg.isPartialLong(last_word)) {
+                    try writer.print("--{s}\n", .{arg.options.long.?});
+                };
+        }
+
+        pub fn successiveX1(
+            parser: *Parser,
+            writer: FileWriter,
+            _: u8,
+            _: Str,
+        ) FileWriter.Error!void {
+            for (parser.arguments.items) |*arg|
+                if (arg.options.short != null and arg.options.long != null) {
+                    try writer.print("-{s}, --{s}\n", .{ arg.options.short.?, arg.options.long.? });
+                } else if (arg.options.short) |name| {
+                    try writer.print("-{s}       \n", .{name});
+                } else if (arg.options.long) |name| {
+                    try writer.print("      --{s}\n", .{name});
+                };
+        }
+    };
+};
 
 //-----------------//
 // Print utilities //
 //-----------------//
-
-fn FnPtrType(comptime T: type) type {
-    return switch (@import("builtin").zig_backend) {
-        .stage1 => T,
-        else => *const T,
-    };
-}
 
 pub fn formatRepr(
     bytes: Str,

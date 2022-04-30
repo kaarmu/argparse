@@ -2,7 +2,7 @@ const std = @import("std");
 const ap = @import("src/argparse.zig");
 
 // my user-defined constructor for my parser
-const myParser = @import("example-completion.zig").myParser;
+const myParser = @import("completion-ex.zig").myParser;
 
 pub fn main() !void {
     // setup allocator

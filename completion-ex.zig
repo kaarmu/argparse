@@ -24,15 +24,16 @@ pub inline fn myParser(allocator: std.mem.Allocator) !ap.Parser {
 }
 
 pub fn main() !void {
+
     // setup allocator
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     var allocator = arena.allocator();
     defer arena.deinit();
 
-    // create parser
+    // setup parser
     var parser = try myParser(allocator);
     defer parser.deinit();
 
-    // completion program
-    try ap.bashCompletion(parser, .{});
+    // run completion
+    try (ap.BashCompletion{}).complete(&parser);
 }
