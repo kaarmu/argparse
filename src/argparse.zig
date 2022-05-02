@@ -63,8 +63,8 @@ pub const Parser = struct {
     pub const ParserOptions = struct {
         name: Str = "prog",
         fmtErrFn: ?FormatErrorFn = null,
-        fmtHelpFn: ?FormatHelpFn = null,
-        fmtUsageFn: ?FormatUsageFn = null,
+        fmtHelpFn: ?FormatFn = null,
+        fmtUsageFn: ?FormatFn = null,
     };
 
     /// Initialize the parser.
@@ -127,13 +127,13 @@ pub const Parser = struct {
         defer iterator.deinit();
 
         if (self.options.fmtErrFn == null)
-            self.options.fmtErrFn = formatErrorX1;
+            self.options.fmtErrFn = IncludedFormat.formatErrorX1;
 
         if (self.options.fmtHelpFn == null)
-            self.options.fmtHelpFn = formatHelpX1;
+            self.options.fmtHelpFn = IncludedFormat.formatHelpX1;
 
         if (self.options.fmtUsageFn == null)
-            self.options.fmtUsageFn = formatUsageX1;
+            self.options.fmtUsageFn = IncludedFormat.formatUsageX1;
 
         try self.parse(
             @TypeOf(iterator),
@@ -160,9 +160,9 @@ pub const Parser = struct {
             });
 
         var group = Group.init(self.arguments.items);
+        var parsing_error: ?(ParserError || ArgumentError || Allocator.Error || FileWriter.Error) = null;
 
-        var parsing_error: ?(ParserError || ArgumentError) = while (group.ready) {
-
+        parsing_error = while (group.ready) {
             // ?[:0]T -> ?[]T
             self.item = if (iterator.next()) |item| item[0..] else null;
 
@@ -194,35 +194,32 @@ pub const Parser = struct {
             } else group.ready = false;
         } else null;
 
-        if (parsing_error) |err| {
-            if (self.options.fmtErrFn) |fmtErrFn|
-                try fmtErrFn(
-                    self,
-                    @errSetCast((ParserError || ArgumentError), err),
-                    stderr_writer,
-                )
-            else
-                return err;
+        if (parsing_error == null) {
+            for (self.arguments.items) |*arg|
+                arg.finally() catch |err| {
+                    parsing_error = err;
+                };
         }
 
-        for (self.arguments.items) |*arg|
-            arg.finally() catch |err| {
-                if (@TypeOf(err) == Allocator.Error)
-                    return err;
-                if (self.options.fmtErrFn) |fmtErrFn|
-                    try fmtErrFn(
-                        self,
-                        @errSetCast((ParserError || ArgumentError), err),
-                        stderr_writer,
-                    )
-                else
-                    return err;
-            };
+        if (parsing_error) |err| {
+            for (@typeInfo(ParserError || ArgumentError).ErrorSet.?) |ref_err| {
+                if (std.mem.eql(u8, ref_err.name, @errorName(err)))
+                    if (self.options.fmtErrFn) |fmtErrFn| {
+                        try fmtErrFn(.{
+                            .parser = self,
+                            .writer = stderr_writer,
+                            .argument = group.needle,
+                            .err = @errSetCast((ParserError || ArgumentError), err),
+                        });
+                        break;
+                    };
+            } else return err;
+        }
 
         if (self.options.fmtHelpFn) |fmtHelpFn| {
             const arg_help = try self.getArgument("--help");
             if (arg_help.getResult(.{ .Type = bool }))
-                try fmtHelpFn(self, stdout_writer)
+                try fmtHelpFn(.{ .parser = self, .writer = stdout_writer })
             else |_|
                 unreachable;
         }
@@ -639,7 +636,7 @@ pub const Argument = struct {
     }
 
     const GetResultOptions = struct {
-        comptime Type: type = Str,
+        Type: type = Str,
         index: usize = 0,
     };
 
@@ -795,6 +792,22 @@ pub const BashCompletion = struct {
 // Print utilities //
 //-----------------//
 
+pub const FormatOptions = struct {
+    parser: *Parser,
+    writer: FileWriter,
+};
+
+pub const FormatFn = FnPtrType(fn (FormatOptions) FileWriter.Error!void);
+
+pub const FormatErrorOptions = struct {
+    parser: *Parser,
+    writer: FileWriter,
+    argument: *Argument,
+    err: (ParserError || ArgumentError),
+};
+
+pub const FormatErrorFn = FnPtrType(fn (FormatErrorOptions) FileWriter.Error!void);
+
 pub fn formatRepr(
     bytes: Str,
     fmt: enum { upper, angle, short, long },
@@ -808,71 +821,74 @@ pub fn formatRepr(
     }
 }
 
-const FormatUsageFn = FnPtrType(fn (*Parser, FileWriter) FileWriter.Error!void);
+pub const IncludedFormat = struct {
+    pub fn formatUsageX1(opt: FormatOptions) FileWriter.Error!void {
+        var group = Group.init(opt.parser.arguments.items);
 
-pub fn formatUsageX1(parser: *Parser, writer: FileWriter) FileWriter.Error!void {
-    var group = Group.init(parser.arguments.items);
+        try opt.writer.writeAll("usage: ");
+        while (group.ready) : (group.next()) {
+            // print the positional
+            if (group.needle.options.name) |name|
+                try formatRepr(name, .angle, opt.writer)
+            else
+                std.debug.print("arg={s}", .{group.needle});
 
-    try writer.writeAll("usage: ");
-    while (group.ready) : (group.next()) {
-        // print the positional
-        if (group.needle.options.name) |name|
-            try formatRepr(name, .angle, writer)
-        else
-            std.debug.print("arg={s}", .{group.needle});
+            if (group.haystack.len > 0) {
+                // print trunc shorts
+                var short_printed = false;
+                for (group.haystack) |*arg| if (arg.options.short) |name| {
+                    if (!short_printed) try opt.writer.writeAll(" [-");
+                    try opt.writer.writeAll(name);
+                    short_printed = true;
+                };
+                if (short_printed) try opt.writer.writeByte(']');
+                // print longs (and shorts if no trunc)
+                for (group.haystack) |*arg| if (arg.options.long) |name| {
+                    if (arg.options.short == null)
+                        try opt.writer.print(" [--{s}]", .{name});
+                };
+            }
+        }
+        try opt.writer.writeByte('\n');
+    }
 
-        if (group.haystack.len > 0) {
-            // print trunc shorts
-            var short_printed = false;
-            for (group.haystack) |*arg| if (arg.options.short) |name| {
-                if (!short_printed) try writer.writeAll(" [-");
-                try writer.writeAll(name);
-                short_printed = true;
-            };
-            if (short_printed) try writer.writeByte(']');
-            // print longs (and shorts if no trunc)
-            for (group.haystack) |*arg| if (arg.options.long) |name| {
-                if (arg.options.short == null)
-                    try writer.print(" [--{s}]", .{name});
-            };
+    pub fn formatHelpX1(opt: FormatOptions) FileWriter.Error!void {
+        if (opt.parser.options.fmtUsageFn) |fmtUsage|
+            try fmtUsage(opt);
+
+        // positional
+        for (opt.parser.arguments.items) |*arg|
+            if (arg.options.action == .pos) {};
+
+        // other
+        for (opt.parser.arguments.items) |*arg|
+            if (arg.options.action != .pos) {};
+    }
+
+    pub fn formatErrorX1(opt: FormatErrorOptions) FileWriter.Error!void {
+        switch (opt.err) {
+            // ParserError.NameCollision => {},
+            // ParserError.OutOfArguments => {},
+            ParserError.ItemNotRecognized => {
+                try opt.writer.print("error({s}): Item \"{s}\" not recognized.\n", .{ @errorName(opt.err), opt.parser.item });
+            },
+            // ParserError.NoSuchArgument => {},
+            // ParserError.NotValidChoice => {},
+            // ArgumentError.AlreadyFull => {},
+            ArgumentError.MissingResults => {
+                if (opt.argument.options.name) |name|
+                    try opt.writer.print("error({s}): Missing input, item={s}\n", .{ @errorName(opt.err), name })
+                else if (opt.argument.options.long) |name|
+                    try opt.writer.print("error({s}): Missing input, item=--{s}\n", .{ @errorName(opt.err), name })
+                else if (opt.argument.options.short) |name|
+                    try opt.writer.print("error({s}): Missing input, item=-{s}\n", .{ @errorName(opt.err), name });
+            },
+            // ArgumentError.ArgCannotExtend => {},
+            // ArgumentError.CompletionFailed => {},
+            else => @panic("Not implemented message for current error"),
         }
     }
-    try writer.writeByte('\n');
-}
-
-const FormatHelpFn = FnPtrType(fn (*Parser, FileWriter) FileWriter.Error!void);
-
-pub fn formatHelpX1(parser: *Parser, writer: FileWriter) FileWriter.Error!void {
-    if (parser.options.fmtUsageFn) |fmtUsage|
-        try fmtUsage(parser, writer);
-
-    // positional
-    for (parser.arguments.items) |*arg|
-        if (arg.options.action == .pos) {};
-
-    // other
-    for (parser.arguments.items) |*arg|
-        if (arg.options.action != .pos) {};
-}
-
-const FormatErrorFn = FnPtrType(fn (*Parser, (ParserError || ArgumentError), FileWriter) FileWriter.Error!void);
-
-pub fn formatErrorX1(parser: *Parser, err: (ParserError || ArgumentError), writer: FileWriter) FileWriter.Error!void {
-    switch (err) {
-        // ParserError.NameCollision => {},
-        // ParserError.OutOfArguments => {},
-        ParserError.ItemNotRecognized => {
-            try writer.print("error({s}): Item \"{s}\" not recognized.\n", .{ @errorName(err), parser.item });
-        },
-        // ParserError.NoSuchArgument => {},
-        // ParserError.NotValidChoice => {},
-        // ArgumentError.AlreadyFull => {},
-        // ArgumentError.MissingResults => {},
-        // ArgumentError.ArgCannotExtend => {},
-        // ArgumentError.CompletionFailed => {},
-        else => @panic("Not implemented message for current error"),
-    }
-}
+};
 
 //--------------------//
 // Iterator Utilities //

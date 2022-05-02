@@ -20,6 +20,7 @@ pub fn main() !void {
 
     // retreive arguments
     const arg_exe = try parser.getArgument("prog");
+    const arg_help = try parser.getArgument("--help");
     const arg_names = try parser.getArgument("--names");
     const arg_count = try parser.getArgument("--count");
 
@@ -29,6 +30,9 @@ pub fn main() !void {
 
     // get stdout/stderr
     var stdout_writer = std.io.getStdOut().writer();
+
+    // exit with help
+    if (try arg_help.getResult(.{ .Type = bool })) return;
 
     // print names
     try stdout_writer.print("executable = {s}\n", .{exe});
