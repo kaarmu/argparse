@@ -160,14 +160,16 @@ pub const Parser = struct {
             });
 
         var group = Group.init(self.arguments.items);
-        var parsing_error: ?(ParserError || ArgumentError || Allocator.Error || FileWriter.Error) = null;
+        var maybe_error: ?(ParserError || ArgumentError || Allocator.Error || FileWriter.Error) = null;
 
-        parsing_error = while (group.ready) {
+        while (true) {
+
             // ?[:0]T -> ?[]T
             self.item = if (iterator.next()) |item| item[0..] else null;
 
             if (self.item) |item| {
                 if (item[0] == '-') {
+                    // we search for a new needle matching in name among haystack
                     group.needle = for (group.haystack) |*arg| {
                         if (arg.state == .full) continue;
                         if (!arg.isMatch(item)) continue;
@@ -178,30 +180,31 @@ pub const Parser = struct {
                         if (!arg.isMatch(item)) continue;
                         break arg;
                     } else {
-                        group.ready = false;
-                        break ParserError.ItemNotRecognized;
+                        maybe_error = ParserError.ItemNotRecognized;
+                        break; // End: parsing error
                     };
                     try group.needle.found(item);
                 } else if (0 < group.needle.capacity()) {
+                    // needle can be any action
                     if (group.needle.state == .unfound)
                         try group.needle.found(item)
                     else
                         try group.needle.addResult(item);
-                } else {
-                    group.update();
-                    if (group.ready) try group.needle.found(item);
-                }
-            } else group.ready = false;
-        } else null;
+                } else if (group.update()) {
+                    // needle is guaranteed to be .pos
+                    try group.needle.found(item);
+                } else break; // End: success
+            } else break; // End: success
+        }
 
-        if (parsing_error == null) {
+        if (maybe_error == null) {
             for (self.arguments.items) |*arg|
                 arg.finally() catch |err| {
-                    parsing_error = err;
+                    maybe_error = err;
                 };
         }
 
-        if (parsing_error) |err| {
+        if (maybe_error) |err| {
             for (@typeInfo(ParserError || ArgumentError).ErrorSet.?) |ref_err| {
                 if (std.mem.eql(u8, ref_err.name, @errorName(err)))
                     if (self.options.fmtErrFn) |fmtErrFn| {
@@ -228,14 +231,12 @@ pub const Parser = struct {
 
 pub const Group = struct {
     all: []Argument,
-    ready: bool,
     needle: *Argument,
     haystack: []Argument,
 
     pub fn init(all: []Argument) Group {
         return Group{
             .all = all,
-            .ready = true,
             .needle = &all[0],
             .haystack = for (all[1..]) |*arg, i| {
                 if (arg.options.action == .pos) break all[1..i];
@@ -244,7 +245,6 @@ pub const Group = struct {
     }
 
     pub fn reset(self: *Group) void {
-        self.ready = true;
         self.needle = &self.all[0];
         self.haystack = self.all[1..];
         for (self.haystack) |*arg, i| {
@@ -255,13 +255,12 @@ pub const Group = struct {
     }
 
     /// Move needle and haystack to the following group
-    pub fn next(self: *Group) void {
+    pub fn next(self: *Group) bool {
         // find needle index
         const index = for (self.all) |*arg, i| {
             if (arg == self.needle) break i;
         } else {
-            self.ready = false;
-            return;
+            return false;
         };
 
         // set needle to the first .unfound .pos it can find
@@ -270,7 +269,7 @@ pub const Group = struct {
             self.haystack = self.all[i + 1 ..];
             self.needle = arg;
             break;
-        } else self.ready = false;
+        } else return false;
 
         // set the haystack to all between the needle and the following .unfound .pos
         for (self.haystack) |*arg, i| {
@@ -278,10 +277,12 @@ pub const Group = struct {
             self.haystack.len = i;
             break;
         }
+
+        return true;
     }
 
     /// Update needle and haystack to first .unfound .pos (can yield the same group).
-    pub fn update(self: *Group) void {
+    pub fn update(self: *Group) bool {
         // set needle to the first .unfound .pos it can find
         for (self.all) |*arg, i| {
             if (arg.options.action != .pos) continue;
@@ -290,7 +291,7 @@ pub const Group = struct {
             self.haystack = self.all[i + 1 ..];
             self.needle = arg;
             break;
-        } else self.ready = false;
+        } else return false;
 
         // set the haystack to all between the needle and the following .unfound .pos
         for (self.haystack) |*arg, i| {
@@ -298,6 +299,8 @@ pub const Group = struct {
             self.haystack.len = i;
             break;
         }
+
+        return true;
     }
 };
 
@@ -808,47 +811,40 @@ pub const FormatErrorOptions = struct {
 
 pub const FormatErrorFn = FnPtrType(fn (FormatErrorOptions) FileWriter.Error!void);
 
-pub fn formatRepr(
-    bytes: Str,
-    fmt: enum { upper, angle, short, long },
-    writer: FileWriter,
-) FileWriter.Error!void {
-    switch (fmt) {
-        .upper => for (bytes) |c| try writer.writeByte(std.ascii.toUpper(c)),
-        .angle => try writer.print("<{s}>", .{bytes}),
-        .short => try writer.print("-{s}", .{bytes}),
-        .long => try writer.print("--{s}", .{bytes}),
-    }
-}
-
 pub const IncludedFormat = struct {
     pub fn formatUsageX1(opt: FormatOptions) FileWriter.Error!void {
         var group = Group.init(opt.parser.arguments.items);
+        const show_numbers = blk: {
+            var i: u8 = 1;
+            while (group.next()) i += 1;
+            break :blk 1 < i;
+        };
 
-        try opt.writer.writeAll("usage: ");
-        while (group.ready) : (group.next()) {
-            // print the positional
-            if (group.needle.options.name) |name|
-                try formatRepr(name, .angle, opt.writer)
+        try opt.writer.writeAll("Usage: ");
+
+        group.reset();
+        var grp_i: u8 = 1;
+        try opt.writer.writeAll(group.needle.options.name.?);
+
+        if (group.haystack.len > 0) {
+            if (show_numbers)
+                try opt.writer.print(" [OPTIONS {u}]", .{grp_i})
             else
-                std.debug.print("arg={s}", .{group.needle});
+                try opt.writer.writeAll(" [OPTIONS]");
+        }
+
+        while (group.next()) {
+            for (group.needle.options.name.?) |c|
+                try opt.writer.writeByte(std.ascii.toUpper(c));
 
             if (group.haystack.len > 0) {
-                // print trunc shorts
-                var short_printed = false;
-                for (group.haystack) |*arg| if (arg.options.short) |name| {
-                    if (!short_printed) try opt.writer.writeAll(" [-");
-                    try opt.writer.writeAll(name);
-                    short_printed = true;
-                };
-                if (short_printed) try opt.writer.writeByte(']');
-                // print longs (and shorts if no trunc)
-                for (group.haystack) |*arg| if (arg.options.long) |name| {
-                    if (arg.options.short == null)
-                        try opt.writer.print(" [--{s}]", .{name});
-                };
+                if (show_numbers)
+                    try opt.writer.print(" [OPTIONS {u}]", .{grp_i})
+                else
+                    try opt.writer.writeAll(" [OPTIONS]");
             }
         }
+
         try opt.writer.writeByte('\n');
     }
 
@@ -856,13 +852,157 @@ pub const IncludedFormat = struct {
         if (opt.parser.options.fmtUsageFn) |fmtUsage|
             try fmtUsage(opt);
 
-        // positional
-        for (opt.parser.arguments.items) |*arg|
-            if (arg.options.action == .pos) {};
+        var group = Group.init(opt.parser.arguments.items);
+        const show_numbers = blk: {
+            var i: u8 = 1;
+            while (group.next()) i += 1;
+            break :blk 1 < i;
+        };
 
-        // other
-        for (opt.parser.arguments.items) |*arg|
-            if (arg.options.action != .pos) {};
+        group.reset();
+        var is_new_group = true;
+        var grp_i: u8 = 1;
+        var col2_i: usize = 2;
+        var col3_i: usize = 2;
+        var str_i: usize = undefined;
+        const col23_margin = 6;
+        const window_width = 80;
+
+        // General options
+
+        for (opt.parser.arguments.items) |*arg| if (arg.options.location == .loose) {
+            if (arg.options.short) |name|
+                col2_i = std.math.max(
+                    col2_i,
+                    2 + 1 + name.len + 2,
+                );
+            if (arg.options.long) |name|
+                col3_i = std.math.max(
+                    col3_i,
+                    col2_i + 2 + name.len + col23_margin,
+                );
+        };
+
+        for (opt.parser.arguments.items) |*arg| if (arg.options.location == .loose) {
+            if (is_new_group) {
+                try opt.writer.print("\nGENERAL OPTIONS:", .{});
+                is_new_group = false;
+            }
+
+            try opt.writer.writeByte('\n');
+            str_i = 0;
+
+            if (arg.options.short) |name| {
+                try opt.writer.print("  -{s}", .{name});
+                try opt.writer.writeByte(if (arg.options.long != null) ',' else ' ');
+                str_i += 4 + name.len;
+            }
+            try opt.writer.writeByteNTimes(' ', col2_i - str_i);
+            str_i += col2_i - str_i;
+
+            if (arg.options.long) |name| {
+                try opt.writer.print("--{s}", .{name});
+                str_i += 2 + name.len;
+            }
+            try opt.writer.writeByteNTimes(' ', col3_i - str_i);
+            str_i += col3_i - str_i;
+
+            if (arg.options.help) |help| {
+                var help_tokens = std.mem.tokenize(u8, help, " ");
+                if (help_tokens.next()) |token| {
+                    try opt.writer.writeAll(token);
+                    str_i += token.len;
+                }
+                while (help_tokens.next()) |token|
+                    if (window_width < str_i + 1 + token.len) {
+                        try opt.writer.writeByte('\n');
+                        try opt.writer.writeByteNTimes(' ', col3_i);
+                        str_i = col3_i;
+                        try opt.writer.writeAll(token);
+                        str_i += token.len;
+                    } else {
+                        try opt.writer.writeByte(' ');
+                        try opt.writer.writeAll(token);
+                        str_i += 1 + token.len;
+                    };
+            }
+        };
+
+        // accidental condition for 'have general options been printed'
+        if (!is_new_group)
+            try opt.writer.writeByte('\n');
+
+        // other options
+
+        while (true) {
+            is_new_group = true;
+            col2_i = 2;
+            col3_i = 2;
+
+            for (group.haystack) |*arg| if (arg.options.location == .strict) {
+                if (arg.options.short) |name|
+                    col2_i = std.math.max(
+                        col2_i,
+                        2 + 1 + name.len + 2,
+                    );
+                if (arg.options.long) |name|
+                    col3_i = std.math.max(
+                        col3_i,
+                        col2_i + 2 + name.len + col23_margin,
+                    );
+            };
+
+            for (group.haystack) |*arg| if (arg.options.location == .strict) {
+                if (is_new_group) {
+                    if (show_numbers)
+                        try opt.writer.print("\nOPTIONS ({u}):", .{grp_i})
+                    else
+                        try opt.writer.print("\nOPTIONS:", .{});
+                    is_new_group = false;
+                }
+
+                try opt.writer.writeByte('\n');
+                str_i = 0;
+
+                if (arg.options.short) |name| {
+                    try opt.writer.print("  -{s}", .{name});
+                    try opt.writer.writeByte(if (arg.options.long != null) ',' else ' ');
+                    str_i += 4 + name.len;
+                }
+                try opt.writer.writeByteNTimes(' ', col2_i - str_i);
+                str_i += col2_i - str_i;
+
+                if (arg.options.long) |name| {
+                    try opt.writer.print("--{s}", .{name});
+                    str_i += 2 + name.len;
+                }
+                try opt.writer.writeByteNTimes(' ', col3_i - str_i);
+                str_i += col3_i - str_i;
+
+                if (arg.options.help) |help| {
+                    var help_tokens = std.mem.tokenize(u8, help, " ");
+                    if (help_tokens.next()) |token| {
+                        try opt.writer.writeAll(token);
+                        str_i += token.len;
+                    }
+                    while (help_tokens.next()) |token|
+                        if (window_width < str_i + 1 + token.len) {
+                            try opt.writer.writeByte('\n');
+                            try opt.writer.writeByteNTimes(' ', col3_i);
+                            str_i = col3_i;
+                            try opt.writer.writeAll(token);
+                            str_i += token.len;
+                        } else {
+                            try opt.writer.writeByte(' ');
+                            try opt.writer.writeAll(token);
+                            str_i += 1 + token.len;
+                        };
+                }
+            };
+
+            try opt.writer.writeByte('\n');
+            if (group.next()) grp_i += 1 else break;
+        }
     }
 
     pub fn formatErrorX1(opt: FormatErrorOptions) FileWriter.Error!void {
@@ -877,11 +1017,11 @@ pub const IncludedFormat = struct {
             // ArgumentError.AlreadyFull => {},
             ArgumentError.MissingResults => {
                 if (opt.argument.options.name) |name|
-                    try opt.writer.print("error({s}): Missing input, item={s}\n", .{ @errorName(opt.err), name })
+                    try opt.writer.print("error({s}): Missing input, item=\"{s}\"\n", .{ @errorName(opt.err), name })
                 else if (opt.argument.options.long) |name|
-                    try opt.writer.print("error({s}): Missing input, item=--{s}\n", .{ @errorName(opt.err), name })
+                    try opt.writer.print("error({s}): Missing input, item=\"--{s}\"\n", .{ @errorName(opt.err), name })
                 else if (opt.argument.options.short) |name|
-                    try opt.writer.print("error({s}): Missing input, item=-{s}\n", .{ @errorName(opt.err), name });
+                    try opt.writer.print("error({s}): Missing input, item=\"-{s}\"\n", .{ @errorName(opt.err), name });
             },
             // ArgumentError.ArgCannotExtend => {},
             // ArgumentError.CompletionFailed => {},

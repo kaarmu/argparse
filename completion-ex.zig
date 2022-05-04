@@ -17,8 +17,19 @@ pub inline fn myParser(allocator: std.mem.Allocator) !ap.Parser {
     // don't forget to deinit on the parser
     var parser = ap.Parser.init(allocator, .{});
 
-    try parser.addArgument(.{ .short = "n", .long = "names", .nargs = '*' });
-    try parser.addArgument(.{ .short = "c", .long = "count", .nargs = 1, .default = "1" });
+    try parser.addArgument(.{
+        .short = "n",
+        .long = "names",
+        .nargs = '*',
+        .help = "One or multiple names that's printed out COUNT times",
+    });
+    try parser.addArgument(.{
+        .short = "c",
+        .long = "count",
+        .nargs = 1,
+        .default = "1",
+        .help = "Number of times to print out NAMES",
+    });
 
     return parser;
 }

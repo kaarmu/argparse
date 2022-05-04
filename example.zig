@@ -32,10 +32,12 @@ pub fn main() !void {
     var stdout_writer = std.io.getStdOut().writer();
 
     // exit with help
+    std.log.info("{any}", .{try arg_help.getResult(.{ .Type = bool })});
     if (try arg_help.getResult(.{ .Type = bool })) return;
 
     // print names
     try stdout_writer.print("executable = {s}\n", .{exe});
+    _ = exe;
     if (names.len > 0) while (count > 0) : (count -= 1) {
         try stdout_writer.print("count = {d}:\n", .{count});
         for (names) |name|
